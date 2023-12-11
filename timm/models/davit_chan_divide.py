@@ -16,8 +16,7 @@ from .vision_transformer import checkpoint_filter_fn, _init_vit_weights
 
 _logger = logging.getLogger(__name__)
 
-from pdb import set_trace as st
-
+# chan을 window로 분할
 
 def _cfg(url='', **kwargs):
     return {
@@ -70,7 +69,7 @@ class MySequential(nn.Sequential):
 
 
 ##################################################################################
-## MLP and PE(Positional Encoding & Patch Embedding)
+## MLP and PE(Patch Embedding and Positional Encoding)
 class Mlp(nn.Module):
     """ MLP as used in Vision Transformer, MLP-Mixer and related networks
     """
@@ -79,34 +78,18 @@ class Mlp(nn.Module):
             in_features,
             hidden_features=None,
             out_features=None,
-            act_layer=nn.GELU,
-            head_dim = 32,):
+            act_layer=nn.GELU):
         super().__init__()
-
-        self.head_dim = head_dim
-
-        # out_features = out_features or in_features
-        # hidden_features = hidden_features or in_features
-
-        self.fc1 = nn.Linear(self.head_dim, self.head_dim * 4)  # head_dim * mlp_ratio(=4)
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
         self.act = act_layer()
-        self.fc2 = nn.Linear(self.head_dim * 4, self.head_dim)
-
-        
+        self.fc2 = nn.Linear(hidden_features, out_features)
 
     def forward(self, x):
-        assert x.shape[2] % self.head_dim == 0
-
-        B, N, C = x.shape
-        x = x.reshape(B, N, C // self.head_dim, self.head_dim).\
-                        permute(0, 2, 1, 3).contiguous().reshape(-1, N, self.head_dim)
-
         x = self.fc1(x)
         x = self.act(x)
         x = self.fc2(x)
-
-        x = x.reshape(B, C // self.head_dim, N, self.head_dim).permute(0, 2, 1, 3).\
-                        contiguous().reshape(B, N, C)
         return x
 
 
@@ -257,11 +240,45 @@ class ChannelBlock(nn.Module):
                 in_features=dim,
                 hidden_features=mlp_hidden_dim,
                 act_layer=act_layer)
+            
+        # window_size
+        self.window_size = 7
 
     def forward(self, x, size):
         x = self.cpe[0](x, size)
         cur = self.norm1(x)
-        cur = self.attn(cur)
+
+        # --------------------chan divide를 위한 코드 변경 부분--------------------------------- # 
+        # 1) view 후 padding
+        H, W = size
+        B, L, C = x.shape
+        assert L == H * W, "input feature has wrong size"
+        cur = cur.view(B, H, W, C)
+
+        pad_l = pad_t = 0
+        pad_r = (self.window_size - W % self.window_size) % self.window_size
+        pad_b = (self.window_size - H % self.window_size) % self.window_size
+        cur = F.pad(cur, (0, 0, pad_l, pad_r, pad_t, pad_b))
+        _, Hp, Wp, _ = cur.shape
+
+        # 2) Partition
+        cur_windows = window_partition(cur, self.window_size)
+        cur_windows = cur_windows.view(-1, self.window_size * self.window_size, C)
+
+        # 3) Attention
+        cur_windows = self.attn(cur_windows)
+
+        # 4) Reverse
+        cur_windows = cur_windows.view(-1, self.window_size, self.window_size, C)
+        cur = window_reverse(cur_windows, self.window_size, Hp, Wp)
+
+        # 5) Crop(padding 제거) 후 원래 shape 복귀
+        if pad_r > 0 or pad_b > 0:
+            cur = cur[:, :H, :W, :].contiguous()
+        cur = cur.view(B, H * W, C)
+        # ------------------chan divide를 위한 코드 변경 부분------------------------------- # 
+
+
         x = x + self.drop_path(cur)
 
         x = self.cpe[1](x, size)
@@ -271,7 +288,7 @@ class ChannelBlock(nn.Module):
 
 
 ##################################################################################
-## Spatial Attention & Window Partition
+## Spatial Attention and Window Partition
 def window_partition(x, window_size: int):
     """
     Args:
@@ -474,7 +491,6 @@ class DaViT(nn.Module):
 
         main_blocks = []
         for block_id, block_param in enumerate(self.architecture):
-            # 이전 layer의 depth의 수(=현 layer의 첫 depth의 시작점)
             layer_offset_id = len(list(itertools.chain(*self.architecture[:block_id])))
 
             block = nn.ModuleList([

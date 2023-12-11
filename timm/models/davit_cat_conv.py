@@ -16,8 +16,16 @@ from .vision_transformer import checkpoint_filter_fn, _init_vit_weights
 
 _logger = logging.getLogger(__name__)
 
-from pdb import set_trace as st
+# python3 -u -m torch.distributed.launch --nproc_per_node=1 --nnodes=1 --node_rank=0 --master_port=10071 train.py data/dataset/imagenet-mini --model DaViT_tiny --batch-size 8 --lr 1e-3 --native-amp --clip-grad 1.0 --output output/
 
+'''
+feature -- 1/2로 나눠, spatial_attn -- (1x1) conv로 channel recover -- (3x3) -- elementwise sum
+        |- 1/2로 나눠, channel_attn -- (1x1) conv로 channel recover  |
+
+embed_dims = (128, 256, 512, 1024)
+num_heads = (4, 8, 16, 32)
+--> flops : 2312185856, param : 15401064
+'''
 
 def _cfg(url='', **kwargs):
     return {
@@ -68,9 +76,8 @@ class MySequential(nn.Sequential):
                 inputs = module(inputs)
         return inputs
 
-
-##################################################################################
-## MLP and PE(Positional Encoding & Patch Embedding)
+######################################################################
+## MLP(used in Chann and Spatial Block)
 class Mlp(nn.Module):
     """ MLP as used in Vision Transformer, MLP-Mixer and related networks
     """
@@ -79,37 +86,23 @@ class Mlp(nn.Module):
             in_features,
             hidden_features=None,
             out_features=None,
-            act_layer=nn.GELU,
-            head_dim = 32,):
+            act_layer=nn.GELU):
         super().__init__()
-
-        self.head_dim = head_dim
-
-        # out_features = out_features or in_features
-        # hidden_features = hidden_features or in_features
-
-        self.fc1 = nn.Linear(self.head_dim, self.head_dim * 4)  # head_dim * mlp_ratio(=4)
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
         self.act = act_layer()
-        self.fc2 = nn.Linear(self.head_dim * 4, self.head_dim)
-
-        
+        self.fc2 = nn.Linear(hidden_features, out_features)
 
     def forward(self, x):
-        assert x.shape[2] % self.head_dim == 0
-
-        B, N, C = x.shape
-        x = x.reshape(B, N, C // self.head_dim, self.head_dim).\
-                        permute(0, 2, 1, 3).contiguous().reshape(-1, N, self.head_dim)
-
         x = self.fc1(x)
         x = self.act(x)
         x = self.fc2(x)
-
-        x = x.reshape(B, C // self.head_dim, N, self.head_dim).permute(0, 2, 1, 3).\
-                        contiguous().reshape(B, N, C)
         return x
 
 
+######################################################################
+## Positional Encoding(in Chan, Spatial Attn)
 class ConvPosEnc(nn.Module):
     """Depth-wise convolution to get the positional information.
     """
@@ -123,6 +116,7 @@ class ConvPosEnc(nn.Module):
                               groups=dim)
 
     def forward(self, x, size: Tuple[int, int]):
+        # import pdb;pdb.set_trace()
         B, N, C = x.shape
         H, W = size
         assert N == H * W
@@ -134,6 +128,8 @@ class ConvPosEnc(nn.Module):
         return x
 
 
+######################################################################
+## PatchEmbedding
 class PatchEmbed(nn.Module):
     """ 2D Image to Patch Embedding
     """
@@ -191,8 +187,8 @@ class PatchEmbed(nn.Module):
         return x, newsize
 
 
-##################################################################################
-## Channel Attention
+#########################################################################
+## Channel Block & Attention
 class ChannelAttention(nn.Module):
     r""" Channel based self attention.
 
@@ -242,7 +238,18 @@ class ChannelBlock(nn.Module):
                  drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm,
                  ffn=True):
         super().__init__()
-
+        '''
+        self.attn : ChannelAttention(
+                        (qkv): Linear(in_features=96, out_features=288, bias=True)
+                        (proj): Linear(in_features=96, out_features=96, bias=True)
+                    )
+        self.mlp : Mlp(
+                        (fc1): Linear(in_features=96, out_features=384, bias=True)
+                        (act): GELU()
+                        (fc2): Linear(in_features=384, out_features=96, bias=True)
+                    )
+        self.norm : LayerNorm((96,), eps=1e-05, elementwise_affine=True)
+        '''
         self.cpe = nn.ModuleList([ConvPosEnc(dim=dim, k=3),
                                   ConvPosEnc(dim=dim, k=3)])
         self.ffn = ffn
@@ -250,6 +257,7 @@ class ChannelBlock(nn.Module):
         self.attn = ChannelAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
+        # ffn : Feed-Foward Network
         if self.ffn:
             self.norm2 = norm_layer(dim)
             mlp_hidden_dim = int(dim * mlp_ratio)
@@ -259,6 +267,12 @@ class ChannelBlock(nn.Module):
                 act_layer=act_layer)
 
     def forward(self, x, size):
+        # import pdb;pdb.set_trace()
+        '''
+        input x : [B, N, C](ex. [1, 3136, 96])
+        size : int(sqrt(N)), ex:(tensor(56), tensor(56))
+
+        '''
         x = self.cpe[0](x, size)
         cur = self.norm1(x)
         cur = self.attn(cur)
@@ -270,8 +284,8 @@ class ChannelBlock(nn.Module):
         return x, size
 
 
-##################################################################################
-## Spatial Attention & Window Partition
+#########################################################################
+## Window Size Processing
 def window_partition(x, window_size: int):
     """
     Args:
@@ -304,6 +318,8 @@ def window_reverse(windows, window_size: int, H: int, W: int):
     return x
 
 
+#########################################################################
+## Spatial Block and Attention
 class WindowAttention(nn.Module):
     r""" Window based multi-head self attention (W-MSA) module.
 
@@ -388,45 +404,59 @@ class SpatialBlock(nn.Module):
                 act_layer=act_layer)
 
     def forward(self, x, size):
+        '''
+        1) input x에 바로 Positional Encodding 삽입
+        2) padding으로 윈도우에 비례하게 사이즈 맞춤
+        3) window_partition
+        4) attention 후 resize
+        5) 패딩 제거
+        6) 다시 Positional Encoding 처리 및 FFN
+        '''
+        # import pdb;pdb.set_trace()
         H, W = size
         B, L, C = x.shape
         assert L == H * W, "input feature has wrong size"
 
+        # 1)
         shortcut = self.cpe[0](x, size)
         x = self.norm1(shortcut)
         x = x.view(B, H, W, C)
 
+        # 2)
         pad_l = pad_t = 0
         pad_r = (self.window_size - W % self.window_size) % self.window_size
         pad_b = (self.window_size - H % self.window_size) % self.window_size
         x = F.pad(x, (0, 0, pad_l, pad_r, pad_t, pad_b))
         _, Hp, Wp, _ = x.shape
 
+        # 3)
         x_windows = window_partition(x, self.window_size)
         x_windows = x_windows.view(-1, self.window_size * self.window_size, C)
 
+        # 4)
         attn_windows = self.attn(x_windows)
-
         attn_windows = attn_windows.view(-1,
                                          self.window_size,
                                          self.window_size,
                                          C)
         x = window_reverse(attn_windows, self.window_size, Hp, Wp)
 
+        # 5)
         if pad_r > 0 or pad_b > 0:
             x = x[:, :H, :W, :].contiguous()
 
         x = x.view(B, H * W, C)
         x = shortcut + self.drop_path(x)
 
+        # 6)
         x = self.cpe[1](x, size)
         if self.ffn:
             x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x, size
 
 
-##################################################################################
-## Davit
+#########################################################################
+## DaViT
 class DaViT(nn.Module):
     r""" Dual-Attention ViT
 
@@ -457,7 +487,15 @@ class DaViT(nn.Module):
         architecture = [[index] * item for index, item in enumerate(depths)]
         self.architecture = architecture
         self.num_classes = num_classes
-        self.embed_dims = embed_dims
+
+        # flops : 2312185856
+        # param : 15401064
+        embed_dims = (128, 256, 512, 1024)
+        num_heads = (4, 8, 16, 32)
+
+        self.embed_dims = [embed_dims[i] // 2 for i in range(len(embed_dims))]
+        # self.embed_dims = embed_dims
+
         self.num_heads = num_heads
         self.num_stages = len(self.embed_dims)
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, 2 * len(list(itertools.chain(*self.architecture))))]
@@ -465,16 +503,32 @@ class DaViT(nn.Module):
 
         self.img_size = img_size
 
+        '''
+        patch_embed && downsample
+        chan : 3 -> [96, 192, 384, 768]
+        conv2d : (7,7) -> (2,2)
+        '''
         self.patch_embeds = nn.ModuleList([
             PatchEmbed(patch_size=patch_size if i == 0 else 2,
-                       in_chans=in_chans if i == 0 else self.embed_dims[i - 1],
-                       embed_dim=self.embed_dims[i],
+                       in_chans=in_chans if i == 0 else embed_dims[i - 1],  # chans : //2 버전이 아닌, 그냥 버전 사용
+                       embed_dim=embed_dims[i],
                        overlapped=overlapped_patch)
             for i in range(self.num_stages)])
 
         main_blocks = []
+
+        # architecture : [[0], [1], [2, 2, 2], [3]]
+        # attention_types : ['spatial', 'channel']
+        # num_heads : [3, 6, 12, 24]
+        # embed_dims : [96, 192, 384, 768]
+        # mlp_ratio : 4.0
+        # ffn : True
+        '''
+        총 4개의 stage(=architecture) 존재, 각 stage당 1개의 ModuleList(=N개의 depth) 존재
+        각 stage 당 [1, 2, 3, 1]개의 depth 존재
+        각 depth당 각 1개의 channel, spatial attn 존재
+        '''
         for block_id, block_param in enumerate(self.architecture):
-            # 이전 layer의 depth의 수(=현 layer의 첫 depth의 시작점)
             layer_offset_id = len(list(itertools.chain(*self.architecture[:block_id])))
 
             block = nn.ModuleList([
@@ -502,33 +556,74 @@ class DaViT(nn.Module):
                 ) for layer_id, item in enumerate(block_param)
             ])
             main_blocks.append(block)
+
         self.main_blocks = nn.ModuleList(main_blocks)
 
-        self.norms = norm_layer(self.embed_dims[-1])
+        # after all blocks
+        self.norms = norm_layer(embed_dims[-1]) # chans : //2 버전이 아닌, 그냥 버전 사용
         self.avgpool = nn.AdaptiveAvgPool1d(1)
-        self.head = nn.Linear(self.embed_dims[-1], num_classes)
+        self.head = nn.Linear(embed_dims[-1], num_classes)  # chans : //2 버전이 아닌, 그냥 버전 사용
 
         if weight_init == 'conv':
             self.apply(_init_conv_weights)
         else:
             self.apply(_init_vit_weights)
 
+        # feature fusion
+        self.conv1 = nn.ModuleList([
+            nn.Conv2d(self.embed_dims[i], embed_dims[i], kernel_size=1, stride=1, padding=0)
+            for i in range(self.num_stages)
+        ])
+        self.conv2 = nn.ModuleList([
+            nn.Conv2d(self.embed_dims[i], embed_dims[i], kernel_size=1, stride=1, padding=0)
+            for i in range(self.num_stages)
+        ])
+
+
     def forward(self, x):
+        '''
+        개선안 : 동시에 진행하고 mlp 후 concat
+        '''
         x, size = self.patch_embeds[0](x, (x.size(2), x.size(3)))
         features = [x]
         sizes = [size]
         branches = [0]
 
+        # architecture : [[0], [1], [2, 2, 2], [3]]
+        # attention_types : ['spatial', 'channel']
+        # num_heads : [3, 6, 12, 24]
+        # embed_dims : [96, 192, 384, 768]
+        # mlp_ratio : 4.0
+        # ---------------------------------self attn stage ---------------------------------------------- # 
+        # 총 stage만큼 실행
         for block_index, block_param in enumerate(self.architecture):
             branch_ids = sorted(set(block_param))
+            # branch_id가 0이 아닐 때 실행, 다운샘플링 실행
+            # x, size : 이전 stage의 output(feature의 chan과 size)
             for branch_id in branch_ids:
                 if branch_id not in branches:
                     x, size = self.patch_embeds[branch_id](features[-1], sizes[-1])
                     features.append(x)
                     sizes.append(size)
                     branches.append(branch_id)
+
+            # 각 stage의 depth만큼 반복
+            # features[branch_id], sizes[branch_id] : 현재 feature, 그 feature의 spatial_size 
+            # block_index, layer_index, branch_id : 현재 stage, depth, stage_idx 
+            # -> 즉 (0,0),(0,1),(0,2),(1,2),(2,2),(0,3)
+            # features[branch_id] : 현 stage의 feature output 저장
             for layer_index, branch_id in enumerate(block_param):
-                features[branch_id], _ = self.main_blocks[block_index][layer_index](features[branch_id], sizes[branch_id])
+                _, _, C = features[branch_id].shape
+                x1, x2 = features[branch_id].split(C // 2, dim=-1)
+
+                x1, _ = self.main_blocks[block_index][layer_index][0](x1, sizes[branch_id])
+                x2, _ = self.main_blocks[block_index][layer_index][1](x2, sizes[branch_id])
+
+                x1 = self.conv1[block_index](x1)
+                x2 = self.conv2[block_index](x2)
+
+                features[branch_id] = x1 + x2
+        # ---------------------------------self attn stage ---------------------------------------------- # 
 
         features[-1] = self.avgpool(features[-1].transpose(1, 2))
         features[-1] = torch.flatten(features[-1], 1)

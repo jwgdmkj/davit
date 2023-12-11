@@ -16,6 +16,7 @@ from .vision_transformer import checkpoint_filter_fn, _init_vit_weights
 
 _logger = logging.getLogger(__name__)
 
+import math
 from pdb import set_trace as st
 
 
@@ -79,34 +80,34 @@ class Mlp(nn.Module):
             in_features,
             hidden_features=None,
             out_features=None,
-            act_layer=nn.GELU,
-            head_dim = 32,):
+            act_layer=nn.GELU,):
         super().__init__()
 
-        self.head_dim = head_dim
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
 
-        # out_features = out_features or in_features
-        # hidden_features = hidden_features or in_features
-
-        self.fc1 = nn.Linear(self.head_dim, self.head_dim * 4)  # head_dim * mlp_ratio(=4)
+        self.conv1 = nn.Conv2d(in_features, hidden_features, 
+                               kernel_size=1, stride=1, padding=0, bias=False)
         self.act = act_layer()
-        self.fc2 = nn.Linear(self.head_dim * 4, self.head_dim)
+        self.conv2 = nn.Conv2d(hidden_features, out_features, 
+                               kernel_size=1, stride=1, padding=0, bias=False)
 
-        
 
     def forward(self, x):
-        assert x.shape[2] % self.head_dim == 0
-
         B, N, C = x.shape
-        x = x.reshape(B, N, C // self.head_dim, self.head_dim).\
-                        permute(0, 2, 1, 3).contiguous().reshape(-1, N, self.head_dim)
+        H = W = int(math.sqrt(N))
 
-        x = self.fc1(x)
+        assert N == H*W, "N must be equal to H*W"
+
+        x = x.permute(0, 2, 1).view(B, C, H, W)
+
+        x = self.conv1(x)
         x = self.act(x)
-        x = self.fc2(x)
+        x = self.conv2(x)
 
-        x = x.reshape(B, C // self.head_dim, N, self.head_dim).permute(0, 2, 1, 3).\
-                        contiguous().reshape(B, N, C)
+        # Reshape x back to [B, N, C]
+        x = x.view(B, C, -1).permute(0, 2, 1)
+        
         return x
 
 
@@ -385,7 +386,7 @@ class SpatialBlock(nn.Module):
             self.mlp = Mlp(
                 in_features=dim,
                 hidden_features=mlp_hidden_dim,
-                act_layer=act_layer)
+                act_layer=act_layer,)
 
     def forward(self, x, size):
         H, W = size

@@ -16,8 +16,8 @@ from .vision_transformer import checkpoint_filter_fn, _init_vit_weights
 
 _logger = logging.getLogger(__name__)
 
-from pdb import set_trace as st
 
+# Channel을 Swin마냥 window로 나눔, 즉 [B' C' Wn^2] * [B' Wn^2 C'] = [B' C' C']
 
 def _cfg(url='', **kwargs):
     return {
@@ -69,8 +69,6 @@ class MySequential(nn.Sequential):
         return inputs
 
 
-##################################################################################
-## MLP and PE(Positional Encoding & Patch Embedding)
 class Mlp(nn.Module):
     """ MLP as used in Vision Transformer, MLP-Mixer and related networks
     """
@@ -79,34 +77,18 @@ class Mlp(nn.Module):
             in_features,
             hidden_features=None,
             out_features=None,
-            act_layer=nn.GELU,
-            head_dim = 32,):
+            act_layer=nn.GELU):
         super().__init__()
-
-        self.head_dim = head_dim
-
-        # out_features = out_features or in_features
-        # hidden_features = hidden_features or in_features
-
-        self.fc1 = nn.Linear(self.head_dim, self.head_dim * 4)  # head_dim * mlp_ratio(=4)
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
         self.act = act_layer()
-        self.fc2 = nn.Linear(self.head_dim * 4, self.head_dim)
-
-        
+        self.fc2 = nn.Linear(hidden_features, out_features)
 
     def forward(self, x):
-        assert x.shape[2] % self.head_dim == 0
-
-        B, N, C = x.shape
-        x = x.reshape(B, N, C // self.head_dim, self.head_dim).\
-                        permute(0, 2, 1, 3).contiguous().reshape(-1, N, self.head_dim)
-
         x = self.fc1(x)
         x = self.act(x)
         x = self.fc2(x)
-
-        x = x.reshape(B, C // self.head_dim, N, self.head_dim).permute(0, 2, 1, 3).\
-                        contiguous().reshape(B, N, C)
         return x
 
 
@@ -191,8 +173,6 @@ class PatchEmbed(nn.Module):
         return x, newsize
 
 
-##################################################################################
-## Channel Attention
 class ChannelAttention(nn.Module):
     r""" Channel based self attention.
 
@@ -270,8 +250,6 @@ class ChannelBlock(nn.Module):
         return x, size
 
 
-##################################################################################
-## Spatial Attention & Window Partition
 def window_partition(x, window_size: int):
     """
     Args:
@@ -425,8 +403,6 @@ class SpatialBlock(nn.Module):
         return x, size
 
 
-##################################################################################
-## Davit
 class DaViT(nn.Module):
     r""" Dual-Attention ViT
 
@@ -474,7 +450,6 @@ class DaViT(nn.Module):
 
         main_blocks = []
         for block_id, block_param in enumerate(self.architecture):
-            # 이전 layer의 depth의 수(=현 layer의 첫 depth의 시작점)
             layer_offset_id = len(list(itertools.chain(*self.architecture[:block_id])))
 
             block = nn.ModuleList([

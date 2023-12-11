@@ -16,8 +16,6 @@ from .vision_transformer import checkpoint_filter_fn, _init_vit_weights
 
 _logger = logging.getLogger(__name__)
 
-from pdb import set_trace as st
-
 
 def _cfg(url='', **kwargs):
     return {
@@ -69,6 +67,68 @@ class MySequential(nn.Sequential):
         return inputs
 
 
+######################################################################
+## SENet for Channel-wise
+class SENet(nn.Module):
+    def __init__(self, channel, reduction=16):
+        super(SENet, self).__init__()
+
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channel, channel // reduction, kernel_size=1),
+            nn.ReLU(),
+            nn.Conv2d(channel // reduction, channel, kernel_size=1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x, H, W):
+        B, N, C = x.shape
+        if H is None or W is None:
+            raise ValueError("H and W need to be defined")
+        assert N == H * W, "Input feature has wrong size"
+
+        # Reshape to [B, C, H, W]
+        x = x.transpose(1, 2).view(B, C, H, W)
+
+        # Squeeze and Excitation
+        y = self.se(x)
+        x = x * y
+
+        # Reshape back to [B, N, C]
+        x = x.view(B, C, H * W).transpose(1, 2)
+        return x
+
+def exclude(x, x_, H, W, k=32):
+    """ Exclude the specified indices from the tensor.
+    output은 무조건 B C H W로 만들어야 함.
+    x는 무조건 B C HW로 만들어야 함(또는 B C H W)
+    현 x는 B C H W, X_는 B HW C
+    """
+    B, N, C = x_.shape
+    x = x.view(B, C, H*W)
+
+    x_ = x_.transpose(1,2)
+    summed_features = x_.sum(dim=-1)
+
+    # Find the indices of the channels with the smallest sum
+    _, min_indices = torch.topk(summed_features, k, largest=False)
+    min_indices = sorted(min_indices.tolist()[0])
+
+    # Split the tensor into slices, excluding the specified indices
+    slices = []
+    start = 0
+
+    for index in min_indices:
+        if start < index:
+            slices.append(x[:, start:index])
+        start = index + 1
+
+    if start < x.size(1):
+        slices.append(x[:, start:])
+
+    out = torch.cat(slices, dim=1) if slices else x
+    return out.view(B, -1, H, W)
+
 ##################################################################################
 ## MLP and PE(Positional Encoding & Patch Embedding)
 class Mlp(nn.Module):
@@ -79,34 +139,18 @@ class Mlp(nn.Module):
             in_features,
             hidden_features=None,
             out_features=None,
-            act_layer=nn.GELU,
-            head_dim = 32,):
+            act_layer=nn.GELU):
         super().__init__()
-
-        self.head_dim = head_dim
-
-        # out_features = out_features or in_features
-        # hidden_features = hidden_features or in_features
-
-        self.fc1 = nn.Linear(self.head_dim, self.head_dim * 4)  # head_dim * mlp_ratio(=4)
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
         self.act = act_layer()
-        self.fc2 = nn.Linear(self.head_dim * 4, self.head_dim)
-
-        
+        self.fc2 = nn.Linear(hidden_features, out_features)
 
     def forward(self, x):
-        assert x.shape[2] % self.head_dim == 0
-
-        B, N, C = x.shape
-        x = x.reshape(B, N, C // self.head_dim, self.head_dim).\
-                        permute(0, 2, 1, 3).contiguous().reshape(-1, N, self.head_dim)
-
         x = self.fc1(x)
         x = self.act(x)
         x = self.fc2(x)
-
-        x = x.reshape(B, C // self.head_dim, N, self.head_dim).permute(0, 2, 1, 3).\
-                        contiguous().reshape(B, N, C)
         return x
 
 
@@ -142,10 +186,15 @@ class PatchEmbed(nn.Module):
             patch_size=16,
             in_chans=3,
             embed_dim=96,
-            overlapped=False):
+            overlapped=False,
+            k=32):
+        
         super().__init__()
         patch_size = to_2tuple(patch_size)
         self.patch_size = patch_size
+
+        # k(topk) = 첫 Patch Embedding에서 제외할 channel의 수
+        self.k = k
 
         if patch_size[0] == 4:
             self.proj = nn.Conv2d(
@@ -154,7 +203,11 @@ class PatchEmbed(nn.Module):
                 kernel_size=(7, 7),
                 stride=patch_size,
                 padding=(3, 3))
-            self.norm = nn.LayerNorm(embed_dim)
+            self.norm = nn.LayerNorm(embed_dim - k)
+            
+            # SENet for dimension reduction
+            self.senet = SENet(embed_dim)
+
         if patch_size[0] == 2:
             kernel = 3 if overlapped else 2
             pad = 1 if overlapped else 0
@@ -166,9 +219,15 @@ class PatchEmbed(nn.Module):
                 padding=to_2tuple(pad))
             self.norm = nn.LayerNorm(in_chans)
 
+            # SENet for dimension reduction
+            self.senet = None
+
+    
+
     def forward(self, x, size):
         H, W = size
         dim = len(x.shape)
+
         if dim == 3:
             B, HW, C = x.shape
             x = self.norm(x)
@@ -184,6 +243,15 @@ class PatchEmbed(nn.Module):
             x = F.pad(x, (0, 0, 0, self.patch_size[0] - H % self.patch_size[0]))
 
         x = self.proj(x)
+
+        ####################### SENet 넣고, softmax, 합치기 등 진행 ########################
+        if self.senet is not None:
+            B_, C_, H_, W_ = x.shape
+            x_ = self.senet(x.view(B_, H_*W_, C_), H_, W_)
+            x_ = F.softmax(x_, dim=-1)
+            x = exclude(x, x_, H_, W_, self.k)
+        ####################### SENet 넣고, softmax, 합치기 등 진행 ########################
+
         newsize = (x.size(2), x.size(3))
         x = x.flatten(2).transpose(1, 2)
         if dim == 4:
@@ -454,6 +522,11 @@ class DaViT(nn.Module):
                  ):
         super().__init__()
 
+        # 일단 96으로 시작해서, 64로 만들고 2배씩 늘려가야 함.
+        embed_dims = (96, 128, 256, 512)
+        num_heads = (2, 4, 8, 16)
+        self.reduced_embed = (64, 128, 256, 512)
+
         architecture = [[index] * item for index, item in enumerate(depths)]
         self.architecture = architecture
         self.num_classes = num_classes
@@ -465,12 +538,22 @@ class DaViT(nn.Module):
 
         self.img_size = img_size
 
+        #################### PatchEmbed에서 topk를 제정 후 channel 삭감 #########################
         self.patch_embeds = nn.ModuleList([
             PatchEmbed(patch_size=patch_size if i == 0 else 2,
-                       in_chans=in_chans if i == 0 else self.embed_dims[i - 1],
-                       embed_dim=self.embed_dims[i],
+                       # in_chans=in_chans if i == 0 else self.embed_dims[i - 1],
+                       # embed_dim=self.embed_dims[i],
+                       in_chans=in_chans if i == 0 else self.reduced_embed[i - 1],
+                       embed_dim=self.embed_dims[i] if i==0 else self.reduced_embed[i],
                        overlapped=overlapped_patch)
             for i in range(self.num_stages)])
+        # for i in range(self.num_stages):
+        #     if i ==0 :
+        #         print('if i==0, in_chans : ', in_chans)
+        #     else :
+        #         print('else, in_chans : ', self.embed_dims[i-1])
+        #     print('embed_dims : ', self.embed_dims[i])
+        #################### PatchEmbed에서 topk를 제정 후 channel 삭감 #########################
 
         main_blocks = []
         for block_id, block_param in enumerate(self.architecture):
@@ -480,7 +563,8 @@ class DaViT(nn.Module):
             block = nn.ModuleList([
                 MySequential(*[
                     ChannelBlock(
-                        dim=self.embed_dims[item],
+                        # dim=self.embed_dims[item],
+                        dim = self.reduced_embed[item],
                         num_heads=self.num_heads[item],
                         mlp_ratio=mlp_ratio,
                         qkv_bias=qkv_bias,
@@ -489,7 +573,8 @@ class DaViT(nn.Module):
                         ffn=ffn,
                     ) if attention_type == 'channel' else
                     SpatialBlock(
-                        dim=self.embed_dims[item],
+                        # dim=self.embed_dims[item],
+                        dim = self.reduced_embed[item],
                         num_heads=self.num_heads[item],
                         mlp_ratio=mlp_ratio,
                         qkv_bias=qkv_bias,
@@ -504,9 +589,13 @@ class DaViT(nn.Module):
             main_blocks.append(block)
         self.main_blocks = nn.ModuleList(main_blocks)
 
-        self.norms = norm_layer(self.embed_dims[-1])
+        # self.norms = norm_layer(self.embed_dims[-1])
+        self.norms = norm_layer(self.reduced_embed[-1])
+
         self.avgpool = nn.AdaptiveAvgPool1d(1)
-        self.head = nn.Linear(self.embed_dims[-1], num_classes)
+
+        # self.head = nn.Linear(self.embed_dims[-1], num_classes)
+        self.head = nn.Linear(self.reduced_embed[-1], num_classes)
 
         if weight_init == 'conv':
             self.apply(_init_conv_weights)

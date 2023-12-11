@@ -10,3 +10,6 @@ from .parsers import create_parser
 from .real_labels import RealLabelsImagenet
 from .transforms import *
 from .transforms_factory import create_transform
+
+from .cifar import cifar10, cifar100
+from .mydataset import MyDataset, MyTransform

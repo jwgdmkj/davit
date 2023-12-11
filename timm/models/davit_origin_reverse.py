@@ -16,8 +16,6 @@ from .vision_transformer import checkpoint_filter_fn, _init_vit_weights
 
 _logger = logging.getLogger(__name__)
 
-from pdb import set_trace as st
-
 
 def _cfg(url='', **kwargs):
     return {
@@ -79,34 +77,18 @@ class Mlp(nn.Module):
             in_features,
             hidden_features=None,
             out_features=None,
-            act_layer=nn.GELU,
-            head_dim = 32,):
+            act_layer=nn.GELU):
         super().__init__()
-
-        self.head_dim = head_dim
-
-        # out_features = out_features or in_features
-        # hidden_features = hidden_features or in_features
-
-        self.fc1 = nn.Linear(self.head_dim, self.head_dim * 4)  # head_dim * mlp_ratio(=4)
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
         self.act = act_layer()
-        self.fc2 = nn.Linear(self.head_dim * 4, self.head_dim)
-
-        
+        self.fc2 = nn.Linear(hidden_features, out_features)
 
     def forward(self, x):
-        assert x.shape[2] % self.head_dim == 0
-
-        B, N, C = x.shape
-        x = x.reshape(B, N, C // self.head_dim, self.head_dim).\
-                        permute(0, 2, 1, 3).contiguous().reshape(-1, N, self.head_dim)
-
         x = self.fc1(x)
         x = self.act(x)
         x = self.fc2(x)
-
-        x = x.reshape(B, C // self.head_dim, N, self.head_dim).permute(0, 2, 1, 3).\
-                        contiguous().reshape(B, N, C)
         return x
 
 
@@ -463,6 +445,9 @@ class DaViT(nn.Module):
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, 2 * len(list(itertools.chain(*self.architecture))))]
         assert self.num_stages == len(self.num_heads) == (sorted(list(itertools.chain(*self.architecture)))[-1] + 1)
 
+        # attention type reverse
+        attention_types = ('channel', 'spatial')
+
         self.img_size = img_size
 
         self.patch_embeds = nn.ModuleList([
@@ -503,6 +488,7 @@ class DaViT(nn.Module):
             ])
             main_blocks.append(block)
         self.main_blocks = nn.ModuleList(main_blocks)
+        
 
         self.norms = norm_layer(self.embed_dims[-1])
         self.avgpool = nn.AdaptiveAvgPool1d(1)

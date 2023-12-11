@@ -14,13 +14,6 @@ NVIDIA CUDA specific speedups adopted from NVIDIA Apex examples
 
 Hacked together by / Copyright 2020 Ross Wightman (https://github.com/rwightman)
 """
-
-# port : 10088
-# python3 -u -m torch.distributed.launch --nproc_per_node=1 --nnodes=1 --node_rank=0 --master_port=10071 train.py data/dataset/imagenet-mini --model DaViT_tiny --batch-size 8 --lr 1e-3 --native-amp --clip-grad 1.0 --output output/
-# python3 -u -m torch.distributed.launch --nproc_per_node=1 --nnodes=1 --node_rank=0 --master_port=10071 train.py /data/mydataset/classification/102flower --model DaViT_tiny --batch-size 8 --lr 1e-3 --native-amp --clip-grad 1.0 --output output/ --dataset flow
-# cifar10 : python3 -u -m torch.distributed.launch --nproc_per_node=2 --nnodes=1 --node_rank=0 --master_port=10071 train.py /data/mydataset/classification/cifar10_imgnet/ --model DaViT_tiny --batch-size 32 --lr 1e-3 --native-amp --clip-grad 1.0 --output output/ --dataset cifar10
-# cifar100: python3 -u -m torch.distributed.launch --nproc_per_node=2 --nnodes=1 --node_rank=0 --master_port=10071 train.py /data/mydataset/classification/cifar100_imgnet/ --model DaViT_tiny --batch-size 32 --lr 1e-3 --native-amp --clip-grad 1.0 --output output/ --dataset cifar100
-
 import argparse
 import time
 import yaml
@@ -68,12 +61,6 @@ try:
     has_wandb = True
 except ImportError: 
     has_wandb = False
-
-##### Own Dataset 
-from timm.data.cifar import cifar100
-from timm.data.mydataset import MyDataset, MyTransform
-from torchvision import datasets, transforms, models
-
 
 torch.backends.cudnn.benchmark = True
 # torch.autograd.set_detect_anomaly(True)
@@ -395,15 +382,6 @@ def main():
 
     random_seed(args.seed, args.rank)
 
-    ####################### flow ########################################################
-    if args.dataset == 'cifar100':
-        args.num_classes = 100
-    elif args.dataset == 'cifar10':
-        args.num_classes = 10
-    elif args.datset == 'flow':
-        args.num_classes = 102
-    ####################### flow ########################################################
-
     model = create_model(
         args.model,
         pretrained=args.pretrained,
@@ -524,7 +502,7 @@ def main():
         else:
             if args.local_rank == 0:
                 _logger.info("Using native Torch DistributedDataParallel.")
-            model = NativeDDP(model, device_ids=[args.local_rank], find_unused_parameters=True)  # , find_unused_parameters=True
+            model = NativeDDP(model, device_ids=[args.local_rank])  # , find_unused_parameters=True
         # NOTE: EMA model does not need to be wrapped by DDP
 
     # setup learning rate schedule and starting epoch
@@ -542,22 +520,12 @@ def main():
         _logger.info('Scheduled epochs: {}'.format(num_epochs))
 
     # create the train and eval datasets
-    # __getitem__, __len__ 등의 def가 내장되어 있는 class를 뱉어야 함
-    ################### 102flower ###################################################
-    if args.dataset == 'None': 
-        pass
-    ################### 102flower ###################################################
-
-    else : 
-        # train(val)_split : train/validation
-        dataset_train = create_dataset(
-            args.dataset,
-            root=args.data_dir, split=args.train_split, is_training=True,
-            batch_size=args.batch_size, repeats=args.epoch_repeats)
-        dataset_eval = create_dataset(
-            args.dataset, root=args.data_dir, split=args.val_split, is_training=False, batch_size=args.batch_size)
-
-    
+    dataset_train = create_dataset(
+        args.dataset,
+        root=args.data_dir, split=args.train_split, is_training=True,
+        batch_size=args.batch_size, repeats=args.epoch_repeats)
+    dataset_eval = create_dataset(
+        args.dataset, root=args.data_dir, split=args.val_split, is_training=False, batch_size=args.batch_size)
 
     # setup mixup / cutmix
     collate_fn = None
@@ -582,57 +550,49 @@ def main():
     train_interpolation = args.train_interpolation
     if args.no_aug or not train_interpolation:
         train_interpolation = data_config['interpolation']
-    
-    ################### 102flower ###################################################
-    # TODO: Using the image datasets and the trainforms, define the dataloaders
-    if args.dataset == 'None': 
-        pass
-    ################### 102flower ###################################################
+    loader_train = create_loader(
+        dataset_train,
+        input_size=data_config['input_size'],
+        batch_size=args.batch_size,
+        is_training=True,
+        use_prefetcher=args.prefetcher,
+        no_aug=args.no_aug,
+        re_prob=args.reprob,
+        re_mode=args.remode,
+        re_count=args.recount,
+        re_split=args.resplit,
+        scale=args.scale,
+        ratio=args.ratio,
+        hflip=args.hflip,
+        vflip=args.vflip,
+        color_jitter=args.color_jitter,
+        auto_augment=args.aa,
+        num_aug_splits=num_aug_splits,
+        interpolation=train_interpolation,
+        mean=data_config['mean'],
+        std=data_config['std'],
+        num_workers=args.workers,
+        distributed=args.distributed,
+        collate_fn=collate_fn,
+        pin_memory=args.pin_mem,
+        use_multi_epochs_loader=args.use_multi_epochs_loader,
+        repeated_aug=args.repeated_aug
+    )
 
-    else :
-        loader_train = create_loader(
-            dataset_train,
-            input_size=data_config['input_size'],
-            batch_size=args.batch_size,
-            is_training=True,
-            use_prefetcher=args.prefetcher,
-            no_aug=args.no_aug,
-            re_prob=args.reprob,
-            re_mode=args.remode,
-            re_count=args.recount,
-            re_split=args.resplit,
-            scale=args.scale,
-            ratio=args.ratio,
-            hflip=args.hflip,
-            vflip=args.vflip,
-            color_jitter=args.color_jitter,
-            auto_augment=args.aa,
-            num_aug_splits=num_aug_splits,
-            interpolation=train_interpolation,
-            mean=data_config['mean'],
-            std=data_config['std'],
-            num_workers=args.workers,
-            distributed=args.distributed,
-            collate_fn=collate_fn,
-            pin_memory=args.pin_mem,
-            use_multi_epochs_loader=args.use_multi_epochs_loader,
-            repeated_aug=args.repeated_aug
-        )
-
-        loader_eval = create_loader(
-            dataset_eval,
-            input_size=data_config['input_size'],
-            batch_size=args.validation_batch_size_multiplier * args.batch_size,
-            is_training=False,
-            use_prefetcher=args.prefetcher,
-            interpolation=data_config['interpolation'],
-            mean=data_config['mean'],
-            std=data_config['std'],
-            num_workers=args.workers,
-            distributed=args.distributed,
-            crop_pct=data_config['crop_pct'],
-            pin_memory=args.pin_mem,
-        )
+    loader_eval = create_loader(
+        dataset_eval,
+        input_size=data_config['input_size'],
+        batch_size=args.validation_batch_size_multiplier * args.batch_size,
+        is_training=False,
+        use_prefetcher=args.prefetcher,
+        interpolation=data_config['interpolation'],
+        mean=data_config['mean'],
+        std=data_config['std'],
+        num_workers=args.workers,
+        distributed=args.distributed,
+        crop_pct=data_config['crop_pct'],
+        pin_memory=args.pin_mem,
+    )
 
     # setup loss function
     if args.jsd:
@@ -675,7 +635,6 @@ def main():
         with open(os.path.join(output_dir, 'args.yaml'), 'w') as f:
             f.write(args_text)
 
-    ##### epoch #########################################################
     try:
         for epoch in range(start_epoch, num_epochs):
             if args.distributed and hasattr(loader_train.sampler, 'set_epoch'):
@@ -713,7 +672,6 @@ def main():
                 # save proper checkpoint with eval metric
                 save_metric = eval_metrics[eval_metric]
                 best_metric, best_epoch = saver.save_checkpoint(epoch, metric=save_metric)
-    ##### epoch #########################################################
 
     except KeyboardInterrupt:
         pass
@@ -744,23 +702,19 @@ def train_one_epoch(
     num_updates = epoch * len(loader)
     for batch_idx, (input, target) in enumerate(loader):
         # print(input.shape, target.shape)  # torch.Size([128, 3, 224, 224]) torch.Size([128, 1000])
-        
-        input, target = input.to('cuda'), target.to('cuda')
-
         last_batch = batch_idx == last_idx
         data_time_m.update(time.time() - end)
         
         if lr_scheduler is not None:
             lr_scheduler.step_frac(epoch + (batch_idx + 1) / len(loader))
 
-        if not args.prefetcher: # default : True  --> Skip
+        if not args.prefetcher:
             input, target = input.cuda(), target.cuda()
             if mixup_fn is not None:
                 input, target = mixup_fn(input, target)
         if args.channels_last:
             input = input.contiguous(memory_format=torch.channels_last)
 
-        # 필요 시 fp16, fp32를 혼합하여 게산
         with amp_autocast():
             output = model(input)
             loss = loss_fn(output, target)
